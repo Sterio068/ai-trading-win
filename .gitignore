@@ -1,0 +1,14 @@
+﻿# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Env
+.env
+
+# SQLite
+*.db
+
+# Uvicorn reload cache
+.pytest_cache/
