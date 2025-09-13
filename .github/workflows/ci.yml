@@ -1,0 +1,16 @@
+﻿name: ci
+on:
+  push:
+  pull_request:
+jobs:
+  lint-and-import:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    - run: python -m pip install --upgrade pip
+    - run: pip install -r requirements.txt
+    # 這裡只做最輕量的匯入與 uvicorn 檢查，不會打外網
+    - run: python -c "import backend.app.main as m; print('import_ok', m.app.title)"
