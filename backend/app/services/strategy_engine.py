@@ -1,85 +1,205 @@
-﻿import re, json, math, os
-from datetime import datetime
-from typing import Any, Dict, List, Optional
-from backend.app.svc import db as svc_db
-from sqlalchemy import select, insert
-from backend.app.services.okx_core import get_instrument, get_ticker, place_spot_market_quote, place_swap_market, est_min_notional
-from backend.app.services.ai_openai import plan as ai_plan
+import os, time, hmac, hashlib, base64, json, math
+from typing import Dict, Any, List, Optional, Tuple
+import httpx
 
-def in_window(win:str)->bool:
+OKX_BASE   = os.getenv("OKX_BASE_URL", "https://www.okx.com")
+OKX_KEY    = os.getenv("OKX_API_KEY")
+OKX_SEC    = os.getenv("OKX_API_SECRET")
+OKX_PAS    = os.getenv("OKX_API_PASSPHRASE")
+OKX_SIM    = os.getenv("OKX_SIMULATED", "0") in ("1","true","True","YES","yes")
+
+def _iso(ts_ms:int)->str:
+    s, ms = divmod(int(ts_ms), 1000)
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(s)) + f".{ms:03d}Z"
+
+def _okx_headers(c:httpx.Client, method:str, path:str, body:str="")->Dict[str,str]:
+    ts = int(c.get("/api/v5/public/time").json()["data"][0]["ts"])
+    iso = _iso(ts)
+    pre = f"{iso}{method.upper()}{path}{body}"
+    sig = base64.b64encode(hmac.new(OKX_SEC.encode(), pre.encode(), hashlib.sha256).digest()).decode()
+    h = {
+        "OK-ACCESS-KEY":OKX_KEY,
+        "OK-ACCESS-SIGN":sig,
+        "OK-ACCESS-TIMESTAMP":iso,
+        "OK-ACCESS-PASSPHRASE":OKX_PAS,
+        "Content-Type":"application/json",
+    }
+    if OKX_SIM:
+        h["x-simulated-trading"]="1"
+    return h
+
+def _place_order_spot_market_quote(instId:str, quote_amount:float, side:str="buy")->Dict[str,Any]:
+    """以 USDT 名目下 **SPOT 市價單**（OKX 需使用 tgtCcy=quote_ccy）"""
+    body = {
+        "instId": instId,
+        "tdMode": "cash",
+        "side": side,
+        "ordType": "market",
+        "tgtCcy":"quote_ccy",
+        "sz": f"{quote_amount:.8f}"
+    }
+    with httpx.Client(base_url=OKX_BASE, timeout=20) as c:
+        j = json.dumps(body, separators=(",",":"))
+        h = _okx_headers(c, "POST", "/api/v5/trade/order", j)
+        r = c.post("/api/v5/trade/order", headers=h, content=j)
+        return {"status": r.status_code, "json": r.json()}
+
+def _place_order_swap_market(instId:str, sz:float, side:str="buy", tdMode:str="cross")->Dict[str,Any]:
+    """以 **張數** 下 **SWAP 市價單**"""
+    body = {
+        "instId": instId,
+        "tdMode": tdMode,         # "cross" 或 "isolated"
+        "side": side,
+        "ordType": "market",
+        "sz": f"{sz}",
+        "posSide":"net"
+    }
+    with httpx.Client(base_url=OKX_BASE, timeout=20) as c:
+        j = json.dumps(body, separators=(",",":"))
+        h = _okx_headers(c, "POST", "/api/v5/trade/order", j)
+        r = c.post("/api/v5/trade/order", headers=h, content=j)
+        return {"status": r.status_code, "json": r.json()}
+
+# --- 讀 instrument（拿到 minNotional、ctVal/tick 等） ---
+def get_instrument(inst:str, instType:str)->Dict[str,Any]:
+    with httpx.Client(base_url=os.getenv("API_BASE", ""), timeout=15) as c:
+        # 優先走本服務封裝的 /api/okx/instrument（含 minNotional & ui_hint）
+        base = os.getenv("SELF_BASE_URL", "http://127.0.0.1:8000")
+        try:
+            r = httpx.get(f"{base}/api/okx/instrument", params={"inst":inst,"instType":instType}, timeout=12)
+            if r.status_code==200:
+                return r.json()
+        except Exception:
+            pass
+    # 後備直打 OKX (只拿必要欄位)
+    with httpx.Client(base_url=OKX_BASE, timeout=15) as c:
+        r = c.get("/api/v5/public/instruments", params={"instType":instType, "uly":inst if instType in ("SWAP","FUTURES") else None, "instId": inst})
+        data = r.json().get("data",[]) or [{}]
+        last = c.get("/api/v5/market/ticker", params={"instId": inst}).json().get("data",[{}])[0].get("last","0")
+        info = data[0] if data else {}
+        return {
+            "instId": inst,
+            "instType": instType,
+            "rules": {
+                "minSz": float(info.get("minSz","0") or 0) if "minSz" in info else 0.0,
+                "lotSz": float(info.get("lotSz","0") or 0) if "lotSz" in info else 0.0,
+                "tickSz": float(info.get("tickSz","0.1") or 0.1),
+                "ctVal": float(info.get("ctVal","0") or 0) if "ctVal" in info else 0.0,
+                "ctMult": float(info.get("ctMult","1") or 1),
+            },
+            "price": {"last": float(last or 0)}
+        }
+
+# --- 讀風控 ---
+def get_risk_limits(user_id:str)->Dict[str,Any]:
+    base = os.getenv("SELF_BASE_URL", "http://127.0.0.1:8000")
     try:
-        now = datetime.utcnow()
-        cur = now.hour*60+now.minute
-        a,b = win.split("-"); h1,m1 = [int(x) for x in a.split(":")]; h2,m2=[int(x) for x in b.split(":")]
-        s,e = h1*60+m1, h2*60+m2
-        return (s<=e and s<=cur<=e) or (s>e and (cur>=s or cur<=e))
-    except:
+        r = httpx.get(f"{base}/api/risk/limits", params={"user_id":user_id}, timeout=8)
+        if r.status_code==200:
+            return r.json()
+    except Exception:
+        pass
+    return {"max_symbol":0.0,"max_total":0.0,"daily_loss":0.0,"window":"00:00-23:59"}
+
+def _within_window(window_str:str, now_ts:Optional[float]=None)->bool:
+    now_ts = now_ts or time.time()
+    local = time.localtime(now_ts)
+    hhmm = f"{local.tm_hour:02d}:{local.tm_min:02d}"
+    try:
+        a,b = window_str.split("-")
+        return (a <= hhmm <= b) if a<=b else (hhmm>=a or hhmm<=b)
+    except Exception:
         return True
 
-async def get_limits(user_id:str)->Dict[str,Any]:
-    row = await svc_db.db.fetch_one(select(svc_db.risk_limits).where(svc_db.risk_limits.c.user_id==user_id))
-    if not row:
-        return {"max_symbol":0,"max_total":0,"daily_loss":0,"window":"00:00-23:59"}
-    return {"max_symbol":float(row["max_symbol"]), "max_total":float(row["max_total"]),
-            "daily_loss":float(row["daily_loss"]), "window":row["window"]}
+# --- 當日 PnL（best-effort） ---
+def _get_daily_pnl()->Tuple[float,float]:
+    """回傳 (realized_pnl_today, unrealized_pnl_now)。抓不到就回 (0,0)。"""
+    realized = 0.0
+    unreal   = 0.0
+    try:
+        with httpx.Client(base_url=OKX_BASE, timeout=20) as c:
+            # 取 today 的部分成交（realized 粗估）
+            h = _okx_headers(c, "GET", "/api/v5/trade/fills-history")
+            r = c.get("/api/v5/trade/fills-history", headers=h, params={"limit":"100"})
+            if r.status_code==200:
+                for it in r.json().get("data",[]):
+                    # OKX 不直接回 realized pnl，這裡以 taker 費用+價差估（保守：不扣正負，記為 0）
+                    pass
+            # 取未平倉的浮盈虧（unrealized）
+            h2 = _okx_headers(c, "GET", "/api/v5/account/positions")
+            r2 = c.get("/api/v5/account/positions", headers=h2)
+            if r2.status_code==200:
+                for p in r2.json().get("data",[]):
+                    upl = p.get("upl") or "0"
+                    unreal += float(upl)
+    except Exception:
+        return 0.0, 0.0
+    return realized, unreal
 
-def pnl_guard(user_id:str)->bool:
-    # 這裡可對接 OKX /account/positions 與 /trade/fills 計算日內 PnL。單機版先回 True（不擋）。
-    return True
-
-async def run_dca(settings:Dict[str,Any])->Dict[str,Any]:
-    user_id = settings.get("_user_id")
-    dca = settings.get("dca") or {}
-    instType = (dca.get("instType") or "SPOT").upper()
-    syms = dca.get("symbols") or []
-    budget = float(dca.get("budget") or settings.get("prefs",{}).get("budget") or 0)
-    swap_cfg = settings.get("dca_swap") or {}
-    swap_sz = float(dca.get("sz") or swap_cfg.get("sz") or 0)
-
-    limits = await get_limits(user_id or "")
-    if not in_window(limits["window"]): 
-        return {"ok":False,"reason":"outside_window"}
-    if not pnl_guard(user_id or ""):
-        return {"ok":False,"reason":"pnl_guard"}
-
-    if not syms:
-        return {"ok":False,"reason":"no_symbols"}
-
-    results=[]
-    for instId in syms:
-        # 規則/現價
-        info,minSz,lotSz,tickSz,ctVal,ctMult = get_instrument(instId, instType)
-        last = get_ticker(instId)
-        minNotional = est_min_notional(instType, minSz, last, ctVal, ctMult)
-
-        # 構造 AI 決策 context（會受風控與最小名目約束）
-        ctx = {
-            "instId":instId,"instType":instType,
-            "price":{"last":last},"rules":{"minSz":minSz,"lotSz":lotSz,"tickSz":tickSz,"ctVal":ctVal,"ctMult":ctMult,"minNotional":minNotional},
-            "risk":limits,"sentiment":0.0,"vol":0.0,
-            "budget":budget if instType=="SPOT" else swap_sz,
-            "budget_cap": max(minNotional, budget if instType=="SPOT" else swap_sz),
-        }
-        decision = ai_plan(ctx)
-        action = (decision.get("action") or "hold").lower()
-
-        try:
-            if instType=="SPOT":
-                use_budget = max(budget, minNotional) if action=="buy" else 0
-                if action!="buy" or use_budget<=0:
-                    results.append({"instId":instId,"ok":True,"skip":True,"reason":decision.get("reason")})
-                    continue
-                r = place_spot_market_quote(instId, use_budget)
-                results.append({"instId":instId,"ok":True,"resp":r})
+# --- 讀 AI 設定 ---
+def get_ai_settings(user_id:str)->Dict[str,Any]:
+    base = os.getenv("SELF_BASE_URL", "http://127.0.0.1:8000")
+    r = httpx.get(f"{base}/api/ai/settings", params={"user_id":user_id}, timeout=8)
+    if r.status_code==200:
+        rows = r.json().get("rows",{})
+        # 可能是字串，嘗試 json 轉 dict
+        out={}
+        for k,v in rows.items():
+            if isinstance(v,str):
+                try: out[k]=json.loads(v)
+                except: out[k]=v
             else:
-                use_sz = max(swap_sz, minSz) if action=="buy" else 0
-                if action!="buy" or use_sz<=0:
-                    results.append({"instId":instId,"ok":True,"skip":True,"reason":decision.get("reason")})
-                    continue
-                r = place_swap_market(instId, use_sz)
-                results.append({"instId":instId,"ok":True,"resp":r})
-        except Exception as e:
-            results.append({"instId":instId,"ok":False,"error":str(e),"decision":decision})
+                out[k]=v
+        return out
+    return {}
 
-    any_ok = any(x.get("ok") and not x.get("skip") for x in results)
-    return {"ok": any_ok, "results":results}
+# --- 主策略：DCA（SPOT: 用 budget 名目；SWAP: 用 sz 張） ---
+def run_dca(user_id:str)->Dict[str,Any]:
+    ai = get_ai_settings(user_id)
+    dca = ai.get("dca") or {}
+    symbols = dca.get("symbols") or []
+    instType = (dca.get("instType") or "SPOT").upper()
+    result = {"ok": False, "orders": [], "reason": ""}
+
+    # 風控/時窗/日內虧損
+    rk = get_risk_limits(user_id)
+    if not _within_window(rk.get("window","00:00-23:59")):
+        result["reason"]="outside_window"
+        return result
+    realized, unreal = _get_daily_pnl()
+    if rk.get("daily_loss",0)>0 and (realized+unreal) <= -abs(float(rk["daily_loss"])):
+        result["reason"]="daily_loss_stop"
+        return result
+
+    if instType=="SPOT":
+        budget = float(dca.get("budget", 0))
+        if budget <= 0 or not symbols:
+            result["reason"]="missing_budget_or_symbols"
+            return result
+        per = budget / max(1,len(symbols))
+        for s in symbols:
+            info = get_instrument(s, "SPOT")
+            # 安全下單：若 minNotional 存在，至少覆蓋 minNotional
+            minNotional = float(info.get("rules",{}).get("minNotional", 0) or 0)
+            quote = max(per, minNotional or 1.0)
+            o = _place_order_spot_market_quote(s, quote, side="buy")
+            result["orders"].append({"instId":s, "notional":quote, "resp":o})
+        result["ok"]=True
+        return result
+
+    elif instType in ("SWAP","FUTURES"):
+        # SWAP：以「張」下單
+        sz = float(dca.get("sz", 0) or 0)
+        if sz <= 0 or not symbols:
+            result["reason"]="missing_sz_or_symbols"
+            return result
+        for s in symbols:
+            o = _place_order_swap_market(s, sz, side="buy", tdMode=dca.get("tdMode","cross"))
+            result["orders"].append({"instId":s, "sz":sz, "resp":o})
+        result["ok"]=True
+        return result
+
+    result["reason"]="unsupported_instType"
+    return result
+
+#（之後可擴：run_breakout/run_grid）

@@ -1,11 +1,10 @@
-﻿from fastapi import APIRouter, Query, Request, Response, HTTPException
-from typing import Any, Dict, Optional, Literal
+﻿from fastapi import APIRouter, Query, Request, Response
+from typing import Any, Dict, Optional
 from pydantic import BaseModel
 from sqlalchemy import select, insert, update
 from backend.app.svc import db as svc_db
 from backend.app.services import okx_core as okx
-from backend.app.services.strategy_engine import run_dca
-from backend.app.services.cache import make_etag, cache_get, cache_set
+from backend.app.services.cache import make_etag
 from backend.app.services.metrics import http_requests_total, http_latency
 
 router = APIRouter()
@@ -133,24 +132,8 @@ def orders_history(instType: str, instId: str|None=None, state: str|None=None, l
     if state: p["state"]=state
     return okx.okx_get("/api/v5/trade/orders-history", p)
 
-# ---------- 一鍵 AI 交易 ----------
-class RunIn(BaseModel):
-    kind: Literal["dca","breakout","grid"]
-    user_id: str
-
-@router.post("/api/strategy/run")
-async def run_strategy(payload: RunIn):
-    await svc_db.init_pool()
-    # 目前完整串 DCA（SPOT=budget / SWAP=sz），其他策略可類推填入 engine
-    rows = await svc_db.db.fetch_all(select(svc_db.ai_settings).where(svc_db.ai_settings.c.user_id==payload.user_id))
-    m={}; [m.update({r["key"]:r["data"]}) for r in rows]
-    m["_user_id"]=payload.user_id
-    if payload.kind=="dca":
-        return await run_dca(m)
-    return {"ok":False,"reason":"not_implemented"}
-
 # ---------- 量測中介（可視需要包住所有路由） ----------
-@router.middleware("http")
+# [moved] was: @router.middleware("http")
 async def _metrics_mw(request: Request, call_next):
     path = request.url.path; mth = request.method
     with http_latency.labels(mth, path).time():
