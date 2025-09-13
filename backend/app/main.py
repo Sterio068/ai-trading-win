@@ -19,13 +19,13 @@ scheduler = AsyncIOScheduler()
 
 @app.on_event("startup")
 async def _start_scheduler():
-    # 啟動排程器
+    # Start the scheduler
     if not scheduler.running:
         scheduler.start()
-    # 從 DB 把所有有 cron 的設定掃一遍（僅示範 dca）
+    # Load cron-enabled settings from DB (demo for DCA only)
     base = os.getenv("SELF_BASE_URL", "http://127.0.0.1:8000")
-    # 這裡示範單帳號；正式可掃 ai_settings 使用者清單
-    users = [os.getenv("DEFAULT_USER","sterio068@mail.com")]
+    # Demo uses a single account; production could iterate all ai_settings users
+    users = [os.getenv("DEFAULT_USER", "sterio068@mail.com")]
     for uid in users:
         try:
             r = httpx.get(f"{base}/api/ai/settings", params={"user_id":uid}, timeout=8)
@@ -40,7 +40,7 @@ async def _start_scheduler():
                     job_id = f"dca::{uid}"
                     if scheduler.get_job(job_id):
                         scheduler.remove_job(job_id)
-                    # 用簡易 cron 表達式（分 時 日 月 週）
+                    # Use simple cron expression (minute hour day month weekday)
                     scheduler.add_job(
                         lambda: httpx.post(f"{base}/api/strategy/run", json={"kind":"dca","user_id":uid}, timeout=30),
                         trigger="cron",

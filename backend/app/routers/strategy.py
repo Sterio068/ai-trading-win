@@ -8,16 +8,17 @@ router = APIRouter(prefix="/api/strategy", tags=["strategy"])
 class RunReq(BaseModel):
     kind: str
     user_id: str
-    # 預留：若要一次性覆蓋設定，可附帶 params
-    params: Optional[Dict[str,Any]] = None
+    # Optional override parameters for one-off execution
+    params: Optional[Dict[str, Any]] = None
 
 @router.post("/run")
 def run_strategy(req: RunReq):
+    """Trigger a trading strategy for the given user."""
     try:
-        if req.kind.lower()=="dca":
+        if req.kind.lower() == "dca":
             out = run_dca(req.user_id)
-            return {"ok": True, "kind":"dca", "result": out}
-        # 預留：breakout/grid
-        return {"ok": False, "error":"unsupported_kind"}
+            return {"ok": True, "kind": "dca", "result": out}
+        # Placeholder for future strategies (breakout, grid, etc.)
+        return {"ok": False, "error": "unsupported_kind"}
     except Exception as e:
         return {"ok": False, "error": str(e)}
