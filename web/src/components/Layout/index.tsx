@@ -1,4 +1,4 @@
-import { ReactNode } from "react";
+import type { ReactNode } from "react";
 import { Menu, Settings, LineChart, Activity, Bot, Shield, SlidersHorizontal } from "lucide-react";
 
 interface NavItem {
@@ -25,6 +25,10 @@ const iconMap: Record<string, ReactNode> = {
 };
 
 export function Layout({ navItems, active, onNavigate, children }: LayoutProps) {
+  const appVersion =
+    typeof window !== "undefined"
+      ? String((window as any).__APP_VERSION__ ?? "dev")
+      : "dev";
   return (
     <div className="flex min-h-screen bg-slate-950 text-slate-100">
       <aside className="hidden w-60 flex-col border-r border-slate-800 bg-slate-900/40 p-4 md:flex">
@@ -47,7 +51,7 @@ export function Layout({ navItems, active, onNavigate, children }: LayoutProps) 
             );
           })}
         </nav>
-        <footer className="mt-6 text-xs text-slate-500">版本 {String((window as any).__APP_VERSION__ ?? "dev")}</footer>
+        <footer className="mt-6 text-xs text-slate-500">版本 {appVersion}</footer>
       </aside>
       <main className="flex-1">
         <header className="sticky top-0 z-10 border-b border-slate-800 bg-slate-900/70 backdrop-blur">
