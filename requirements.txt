@@ -1,1 +1,2 @@
+# Delegate dependency management to the backend module.
 -r backend/requirements.txt
