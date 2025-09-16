@@ -24,12 +24,16 @@ def create_app() -> FastAPI:
 
     app = FastAPI(title="AI Quant Trading", version="1.0.0")
 
+    raw_origins = env_manager.get("CORS_ALLOW_ORIGINS", "")
+    allow_origins = [origin.strip() for origin in raw_origins.split(",") if origin.strip()] or [
+        "http://localhost:5173",
+    ]
+
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=allow_origins,
         allow_credentials=True,
-        allow_methods=["*"]
-        ,
+        allow_methods=["*"],
         allow_headers=["*"],
     )
 

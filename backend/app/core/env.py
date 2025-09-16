@@ -14,6 +14,7 @@ DEFAULT_ENV: Dict[str, str] = {
     "EXCHANGE_ACTIVE": "OKX",
     "OPENAI_MODEL_TIER": "GPT-5-MINI",
     "OPENAI_API_KEY": "",
+    "CORS_ALLOW_ORIGINS": "http://localhost:5173,http://127.0.0.1:5173",
     "OKX_API_KEY_PAPER": "",
     "OKX_API_SECRET_PAPER": "",
     "OKX_API_PASSPHRASE_PAPER": "",
