@@ -1,42 +1,97 @@
-﻿import os
-from fastapi import FastAPI
+from __future__ import annotations
+
+import logging
+import time
+import uuid
+from datetime import datetime, timezone
+from typing import Any, Callable, Dict, Optional
+
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.responses import PlainTextResponse, Response, FileResponse
-from starlette.staticfiles import StaticFiles
-from prometheus_client import REGISTRY, CONTENT_TYPE_LATEST, generate_latest
-from backend.app.svc import db as svc_db
-from backend.app.routers import all_routes
+from fastapi.responses import ORJSONResponse
 
-app = FastAPI(title="AI Trading (Windows One-Click)")
+from .core.env import env_manager
+from .core.metrics import REQUEST_COUNTER
+from .core.scheduler import autopilot_controller
+from .core.sentry import init_sentry
+from .routes import backtest, broker, env, ops, risk, sentiment, strategy, ws
 
-CORS = os.getenv("CORS_ORIGINS","*")
-origins = [o.strip() for o in CORS.split(",") if o.strip()]
-app.add_middleware(CORSMiddleware, allow_origins=origins if origins else ["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=True)
+logger = logging.getLogger(__name__)
 
-@app.on_event("startup")
-async def on_start():
-    from backend.app.svc.db import init_schema, init_pool
-    init_schema()
-    await init_pool()
 
-@app.on_event("shutdown")
-async def on_shutdown():
-    from backend.app.svc.db import close_pool
-    await close_pool()
+def create_app() -> FastAPI:
+    init_sentry(env_manager.get("SENTRY_DSN"))
 
-@app.get("/healthz", response_class=PlainTextResponse)
-async def healthz(): return "ok"
+    app = FastAPI(title="AI Quant Trading", version="1.0.0")
 
-@app.get("/readyz")
-async def readyz(): return {"ready": True}
+    raw_origins = env_manager.get("CORS_ALLOW_ORIGINS", "")
+    allow_origins = [origin.strip() for origin in raw_origins.split(",") if origin.strip()] or [
+        "http://localhost:5173",
+    ]
 
-@app.get("/metrics")
-async def metrics(): return Response(content=generate_latest(REGISTRY), media_type=CONTENT_TYPE_LATEST)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allow_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
-# 靜態 UI
-app.mount("/ui", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "..","..","ui"), html=True), name="ui")
-@app.get("/")
-async def root(): return FileResponse(os.path.join(os.path.dirname(__file__), "..","..","ui","index.html"))
+    @app.middleware("http")
+    async def add_request_context(request: Request, call_next: Callable):
+        request_id = uuid.uuid4().hex
+        request.state.request_id = request_id
+        start = time.perf_counter()
+        response = None
+        try:
+            response = await call_next(request)
+            return response
+        finally:
+            duration = time.perf_counter() - start
+            REQUEST_COUNTER.labels(route=request.url.path).inc()
+            logger.debug("Request %s finished in %.4fs", request_id, duration)
 
-# 路由
-app.include_router(all_routes.router)
+    app.include_router(env.router, prefix="/api")
+    app.include_router(broker.router, prefix="/api")
+    app.include_router(risk.router, prefix="/api")
+    app.include_router(backtest.router, prefix="/api")
+    app.include_router(sentiment.router, prefix="/api")
+    app.include_router(strategy.router, prefix="/api")
+    app.include_router(ops.router)
+    app.include_router(ws.router)
+
+    @app.get("/healthz", response_class=ORJSONResponse)
+    async def healthz(request: Request) -> Dict[str, Any]:
+        return standard_response(request, {"status": "ok", "mode": env_manager.mode})
+
+    @app.on_event("startup")
+    async def on_startup() -> None:
+        logger.info("Starting application in %s mode", env_manager.mode)
+        await autopilot_controller.initialize()
+
+    @app.on_event("shutdown")
+    async def on_shutdown() -> None:
+        await autopilot_controller.shutdown()
+
+    return app
+
+
+def standard_response(
+    request: Request,
+    data: Optional[Any] = None,
+    ok: bool = True,
+    error: Optional[Dict[str, Any]] = None,
+    status_code: int = 200,
+) -> ORJSONResponse:
+    payload: Dict[str, Any] = {
+        "ok": ok,
+        "data": data,
+        "request_id": getattr(request.state, "request_id", uuid.uuid4().hex),
+        "meta": {"ts": datetime.now(timezone.utc).isoformat()},
+    }
+    if not ok:
+        payload["error"] = error or {"code": "unknown", "message": "Unknown error"}
+    return ORJSONResponse(status_code=status_code, content=payload)
+
+
+app = create_app()
