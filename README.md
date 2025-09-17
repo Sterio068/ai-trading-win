@@ -24,6 +24,9 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload
 ```
 
+> 📌 若留在專案根目錄，也可以直接執行 `pip install -r requirements.txt`，該檔案會自動委派到 `backend/requirements.txt`。
+>    依賴仍以 `backend/requirements.txt` 為唯一依據，請勿於根目錄檔案調整套件。
+
 ### 2. 前端啟動
 ```bash
 cd web
